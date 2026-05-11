@@ -1,0 +1,41 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# aenv local state
+# .aenv-version pins the env for a working directory; never commit
+# (it leaks the developer's local env name and breaks for other users).
+.aenv-version
+
+# Internal planning docs (kept locally, not published).
+/PLAN.md
+/aenv/PLAN.md
+/plan.md
+/docs/internal/
+/BACKLOG.md
+/CHANGELOG.md
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+.obsidian/
+*.swp
+*.swo
+*~
+
+# Claude Code runtime artifacts (per-session lock with PID/sessionId).
+.claude/scheduled_tasks.lock
+
+# Env / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# OS junk
+Thumbs.db

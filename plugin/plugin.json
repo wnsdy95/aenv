@@ -1,0 +1,8 @@
+{
+  "name": "aenv",
+  "version": "0.1.0",
+  "description": "In-session control plane for aenv (per-env Claude Code isolation). All real work delegates to the aenv host binary.",
+  "author": "aenv",
+  "homepage": "https://github.com/wnsdy95/aenv",
+  "commands": "./commands"
+}

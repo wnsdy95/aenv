@@ -1,0 +1,315 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install Linux secret service deps for keyring
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable]
+        include:
+          # MSRV check on Linux only — keep cheap. Set to 1.88
+          # because ratatui's transitive deps (`darling` ≥ 0.23,
+          # `instability` ≥ 0.3) require it. assert_cmd 2.2 also
+          # needs edition2024 (≥ 1.85). Realistically we follow
+          # whichever transitive bound is tightest.
+          - os: ubuntu-latest
+            rust: 1.88.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Install Linux keyring deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config gnome-keyring dbus-x11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.rust }}
+
+      # On Linux, secrets unit tests don't actually call the keyring — they
+      # only test ${env:VAR} substitution. We therefore don't need to spin up
+      # a real keyring daemon. Integration tests that touch secrets use
+      # explicit env vars only, never `aenv secrets add` in CI.
+      - name: cargo build
+        run: cargo build --release --all-targets
+
+      # Windows runs build-only. The integration test suite uses a fake
+      # `claude` shell script in `$PATH` that the test harness creates
+      # at runtime — that scheme has no Windows equivalent (Windows
+      # needs `claude.exe`, and `cmd.exe` can't run sh scripts). Linux
+      # + macOS exercise the full suite; Windows verifies the binary
+      # compiles + we'd catch any cfg-gated typos there.
+      - name: cargo test
+        if: runner.os != 'Windows'
+        run: cargo test --release --all-targets -- --nocapture
+
+      - name: cargo test (unit only on Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --release --bin aenv -- --nocapture
+
+  cc-version-matrix:
+    name: cc_compatible guard (synthetic)
+    runs-on: ubuntu-latest
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Synthetic CC versions tested against a fixed cc_compatible range.
+        # We don't install Claude Code in CI; instead we feed a fake `claude`
+        # binary that prints a controlled `--version` string. `aenv doctor`
+        # reads it via process exec.
+        cc_version: ["2.1.121", "2.0.5", "3.0.0-rc.1"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux keyring deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release
+
+      - name: doctor against fake claude (cc_version=${{ matrix.cc_version }})
+        env:
+          AENV_HOME: ${{ runner.temp }}/aenv-home
+          CC_FAKE_VERSION: ${{ matrix.cc_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fakebin" "$AENV_HOME"
+          cat > "$RUNNER_TEMP/fakebin/claude" <<EOF
+          #!/usr/bin/env bash
+          if [ "\$1" = "--version" ]; then
+            echo "claude-code/$CC_FAKE_VERSION (test)"
+            exit 0
+          fi
+          exit 0
+          EOF
+          chmod +x "$RUNNER_TEMP/fakebin/claude"
+          export PATH="$RUNNER_TEMP/fakebin:$PATH"
+          AENV=./target/release/aenv
+          "$AENV" init --no-default
+          "$AENV" new pinned
+          # Restrict to >=2.1,<3 — should match 2.1.121, fail 2.0.5, fail 3.0.0-rc.1.
+          cat > "$AENV_HOME/envs/pinned/aenv.toml" <<EOF
+          aenv_schema_version = "1"
+          [env]
+          name = "pinned"
+          cc_compatible = ">=2.1, <3"
+          EOF
+
+          OUT=$("$AENV" doctor pinned --json)
+          echo "$OUT" | jq .
+          MATCH=$(echo "$OUT" | jq -r '.env.cc_compatible_ok')
+          echo "match=$MATCH"
+
+          case "$CC_FAKE_VERSION" in
+            2.1.*) [ "$MATCH" = "true" ]  ;;
+            2.0.*) [ "$MATCH" = "false" ] ;;
+            3.0.*) [ "$MATCH" = "false" ] ;;
+            *)     echo "unhandled" && exit 1 ;;
+          esac
+
+  build-binary:
+    name: release binary (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux keyring deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=./target/release/aenv
+          if [ "${RUNNER_OS}" = "Windows" ]; then BIN="${BIN}.exe"; fi
+          "$BIN" --version
+          "$BIN" --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aenv-${{ matrix.os }}
+          # Glob so the Windows .exe variant is captured too. Without
+          # this the Windows artifact was empty (Cargo produces
+          # `aenv.exe` on Windows; the literal `aenv` path didn't
+          # match anything).
+          path: target/release/aenv*
+          retention-days: 7
+
+  cross-platform-sha-roundtrip:
+    name: cross-platform sha roundtrip (${{ matrix.os }} consumer)
+    runs-on: ${{ matrix.os }}
+    needs: [build-binary, cross-platform-fixture]
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is the producer (job below). The consumer matrix
+        # exercises the realistic git-pull workflow on the other two
+        # OSes — those are where the hash divergence actually mattered.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aenv-${{ matrix.os }}
+          path: ./bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: roundtrip-fixture
+          path: ./fixture
+      - name: install --frozen-equivalent + diff lockfile against producer
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(pwd)/bin/aenv"
+          if [ "${RUNNER_OS}" = "Windows" ]; then BIN="${BIN}.exe"; fi
+          chmod +x "$BIN" || true
+          # `aenv init` insists on a real claude in PATH. CI runners
+          # don't have one. is_executable on Unix accepts any file
+          # with +x; on Windows it requires `.exe`. Branch accordingly.
+          mkdir -p "$RUNNER_TEMP/fakebin"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            # Copy aenv.exe under the name `claude.exe` — passes the
+            # is_executable check (file exists + .exe extension). init
+            # only PATH-walks; it never invokes the binary.
+            cp "$BIN" "$RUNNER_TEMP/fakebin/claude.exe"
+          else
+            cat > "$RUNNER_TEMP/fakebin/claude" <<'EOF'
+          #!/usr/bin/env bash
+          [ "$1" = "--version" ] && echo "claude-code/2.1.121 (test)" || true
+          exit 0
+          EOF
+            chmod +x "$RUNNER_TEMP/fakebin/claude"
+          fi
+          export PATH="$RUNNER_TEMP/fakebin:$PATH"
+          export AENV_HOME="$RUNNER_TEMP/aenv-home"
+          mkdir -p "$AENV_HOME"
+          "$BIN" init --no-default
+          cd ./fixture/project
+          # Re-run install in project-mode. The fixture's aenv.lock was
+          # produced on macOS; this OS recomputes the sha locally and
+          # `aenv install` would rewrite the lock if its sha differed.
+          # If the sha is cross-platform stable, the rewrite is a no-op
+          # (apart from the `generated` timestamp).
+          "$BIN" install
+          # Strip volatile fields (timestamp) and diff. Sha lines must
+          # match byte-for-byte across producer and consumer.
+          strip_volatile() { grep -v -E '^generated\s*=' "$1" || true; }
+          diff <(strip_volatile aenv.lock.producer) <(strip_volatile aenv.lock)
+          echo "cross-platform sha roundtrip OK on ${RUNNER_OS}"
+
+  cross-platform-fixture:
+    name: cross-platform fixture (mac producer)
+    runs-on: macos-latest
+    needs: [build-binary]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aenv-macos-latest
+          path: ./bin
+      - name: build project-mode fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(pwd)/bin/aenv"
+          chmod +x "$BIN"
+          # `aenv init` requires a real claude in PATH; CI runners
+          # don't have one, so drop a fake shim. Same trick as the
+          # cc-version-matrix job above.
+          mkdir -p "$RUNNER_TEMP/fakebin"
+          cat > "$RUNNER_TEMP/fakebin/claude" <<'EOF'
+          #!/usr/bin/env bash
+          [ "$1" = "--version" ] && echo "claude-code/2.1.121 (test)" || true
+          exit 0
+          EOF
+          chmod +x "$RUNNER_TEMP/fakebin/claude"
+          export PATH="$RUNNER_TEMP/fakebin:$PATH"
+          export AENV_HOME="$RUNNER_TEMP/aenv-home"
+          mkdir -p "$AENV_HOME"
+          "$BIN" init --no-default
+          mkdir -p fixture/project
+          cd fixture/project
+          # Local plugin with deterministic content. Includes a hook
+          # script with a shebang so the consumer can verify
+          # ensure_shebang_executable() restores +x at materialize time
+          # despite mode-not-in-hash.
+          mkdir -p plugin/.claude-plugin
+          cat > plugin/.claude-plugin/plugin.json <<'JSON'
+          {"name":"local-test","version":"1.0.0","description":"roundtrip","author":{"name":"ci"}}
+          JSON
+          cat > plugin/run.sh <<'SH'
+          #!/bin/sh
+          echo hi
+          SH
+          chmod 0755 plugin/run.sh
+          # Project-mode workspace.
+          "$BIN" init --here testapp
+          "$BIN" add plugin local-test --source ./plugin
+          "$BIN" install
+          cp aenv.lock aenv.lock.producer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roundtrip-fixture
+          path: fixture/
+          retention-days: 7
+          # `actions/upload-artifact@v4` defaults to excluding hidden
+          # files. Our fixture's plugin manifest lives at
+          # `plugin/.claude-plugin/plugin.json` — without this flag the
+          # entire `.claude-plugin/` dir was silently dropped from the
+          # artifact, the consumer ran install against an incomplete
+          # tree, and shas diverged for reasons that had nothing to do
+          # with the cross-platform invariant we were trying to test.
+          include-hidden-files: true
